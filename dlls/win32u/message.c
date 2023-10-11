@@ -28,6 +28,7 @@
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "win32u_private.h"
+#include "ntgdi_private.h"
 #include "ntuser_private.h"
 #include "winnls.h"
 #include "hidusage.h"
@@ -2779,6 +2780,9 @@ static int peek_message( MSG *msg, HWND hwnd, UINT first, UINT last, UINT flags,
             }
             reply_message( &info, result, &info.msg );
             continue;
+        case MSG_SURFACE:
+            process_surface_message( &info.msg, buffer );
+            continue;
         case MSG_OTHER_PROCESS:
             info.flags = ISMEX_SEND;
             if (!unpack_message( info.msg.hwnd, info.msg.message, &info.msg.wParam,
@@ -2850,6 +2854,15 @@ static int peek_message( MSG *msg, HWND hwnd, UINT first, UINT last, UINT flags,
                 if (!ret) continue; /* ignore it */
                 info.msg.wParam = result.wparam;
                 info.msg.lParam = result.lparam;
+            }
+            /* CXHACK 19488 */
+            if (info.msg.message == WM_PAINT &&
+                    flags == (PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT | PM_QS_SENDMESSAGE) &&
+                    (get_window_long( info.msg.hwnd, GWL_EXSTYLE ) & WS_EX_COMPOSITED ))
+            {
+                send_message( info.msg.hwnd, info.msg.message, info.msg.wParam, info.msg.lParam );
+                flags &= ~PM_QS_PAINT;
+                continue;
             }
             *msg = info.msg;
             msg->pt = point_phys_to_win_dpi( info.msg.hwnd, info.msg.pt );
