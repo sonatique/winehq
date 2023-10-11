@@ -407,6 +407,7 @@ AC_SYS_LARGEFILE()
 AC_CHECK_HEADERS(\
 	CL/cl.h \
 	EGL/egl.h \
+	IOKit/usb/IOUSBLib.h \
 	OpenCL/opencl.h \
 	arpa/inet.h \
 	arpa/nameser.h \
@@ -453,6 +454,7 @@ AC_CHECK_HEADERS(\
 	sys/cdio.h \
 	sys/epoll.h \
 	sys/event.h \
+	sys/eventfd.h \
 	sys/extattr.h \
 	sys/filio.h \
 	sys/ipc.h \
@@ -680,23 +682,30 @@ case $host_os in
     AC_SUBST(APPKIT_LIBS,"-framework AppKit")
     AC_SUBST(SECURITY_LIBS,"-framework Security -framework CoreFoundation")
     AC_SUBST(SYSTEMCONFIGURATION_LIBS,"-framework SystemConfiguration")
+    AC_LANG_PUSH([Objective C])
+        AC_CHECK_HEADERS(AVFoundation/AVFoundation.h)
+    AC_LANG_POP([Objective C])
 
     WINELOADER_LDFLAGS="-Wl,-pie,-segalign,0x1000,-pagezero_size,0x1000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
 
-    wine_can_build_preloader=yes
-    WINEPRELOADER_LDFLAGS="-nostartfiles -nodefaultlibs -e _start -ldylib1.o -Wl,-image_base,0x7d400000,-segalign,0x1000,-pagezero_size,0x1000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist,-segaddr,WINE_4GB_RESERVE,0x100000000"
-    WINE_TRY_CFLAGS([-Wl,-no_new_main -e _main],
-                    [WINEPRELOADER_LDFLAGS="-Wl,-no_new_main $WINEPRELOADER_LDFLAGS"
-                     WINE_TRY_CFLAGS([-Wl,-no_new_main -e _main -mmacosx-version-min=10.7 -nostartfiles -nodefaultlibs],
-                                     [WINEPRELOADER_LDFLAGS="-mmacosx-version-min=10.7 $WINEPRELOADER_LDFLAGS"],
-                                     [wine_can_build_preloader=no])],
-                    [WINE_TRY_CFLAGS([-mmacosx-version-min=10.7 -nostartfiles -nodefaultlibs],
-                                     [WINEPRELOADER_LDFLAGS="-mmacosx-version-min=10.7 $WINEPRELOADER_LDFLAGS"],
-                                     [wine_can_build_preloader=no])])
+    case $host_cpu in
+      *i[[3456]]86*|*x86_64*) wine_can_build_preloader=yes ;;
+      *)                      wine_can_build_preloader=no ;;
+    esac
+
     if test "$wine_can_build_preloader" = "yes"
     then
+        WINEPRELOADER_LDFLAGS="-nostartfiles -nodefaultlibs -e _start -ldylib1.o -mmacosx-version-min=10.7 -Wl,-no_new_main,-segalign,0x1000,-pagezero_size,0x1000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
         WINE_TRY_CFLAGS([-Wl,-no_pie],
                         [WINEPRELOADER_LDFLAGS="-Wl,-no_pie $WINEPRELOADER_LDFLAGS"])
+        case $host_cpu in
+          *i[[3456]]86*)
+            WINEPRELOADER_LDFLAGS="-Wl,-image_base,0x7d400000 $WINEPRELOADER_LDFLAGS"
+            ;;
+          *x86_64*)
+            WINEPRELOADER_LDFLAGS="-Wl,-image_base,0x200000000,-segalign,0x1000,-segaddr,WINE_RESERVE,0x1000 $WINEPRELOADER_LDFLAGS"
+            ;;
+        esac
         dnl If preloader is used, the loader needs to be an LC_UNIXTHREAD binary to avoid AppKit/Core Animation problems.
         WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -mmacosx-version-min=10.7"
     else
@@ -705,6 +714,7 @@ case $host_os in
 
     if test "x$with_coreaudio" != "xno";
     then
+        AC_SUBST(AVFOUNDATION_LIBS,"-framework AVFoundation")
         AC_SUBST(COREAUDIO_LIBS,"-framework CoreFoundation -framework CoreAudio -framework AudioUnit -framework AudioToolbox -framework CoreMIDI")
         enable_winecoreaudio_drv=${enable_winecoreaudio_drv:-yes}
     fi
@@ -712,6 +722,13 @@ case $host_os in
     then
         AC_SUBST(OPENCL_LIBS,"-framework OpenCL")
         ac_cv_lib_OpenCL_clGetPlatformInfo=yes
+    fi
+    if test "$ac_cv_header_IOKit_usb_IOUSBLib_h" = "yes"
+    then
+        ac_save_LIBS="$LIBS"
+        LIBS="$LIBS $IOKIT_LIBS"
+        AC_CHECK_FUNCS(IOServiceMatching)
+        LIBS="$ac_save_LIBS"
     fi
 
     dnl Check for MTLDevice registryID property
@@ -1416,6 +1433,14 @@ fi
 WINE_WARNING_WITH(gnutls,[test "x$ac_cv_lib_soname_gnutls" = "x"],
                  [libgnutls ${notice_platform}development files not found, no schannel support.])
 
+dnl **** Check for libgmp ****
+if test "x$with_gnutls" != "xno"
+then
+    WINE_PACKAGE_FLAGS(GMP,[gmp],[-lgmp],,,
+        [AC_CHECK_HEADERS([gmp.h],
+            [WINE_CHECK_SONAME(gmp,__gmpz_init,,[GMP_CFLAGS=""],[$GMP_LIBS],[[libgmp-*]])])])
+fi
+
 dnl **** Check for SANE ****
 if test "x$with_sane" != "xno"
 then
@@ -1570,7 +1595,7 @@ WINE_NOTICE_WITH(pulse, [test -z "$PULSE_LIBS"],
 dnl **** Check for gstreamer ****
 if test "x$with_gstreamer" != "xno"
 then
-    WINE_PACKAGE_FLAGS(GSTREAMER,[gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0],,,,
+    WINE_PACKAGE_FLAGS(GSTREAMER,[gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-tag-1.0],,,,
         [AC_CHECK_HEADER([gst/gst.h],
             [AC_MSG_CHECKING([whether gint64 defined by gst/gst.h is indeed 64-bit])
               AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <gst/gst.h>]],
@@ -2024,6 +2049,7 @@ AC_CHECK_FUNCS(\
 	port_create \
 	posix_fadvise \
 	posix_fallocate \
+	ppoll \
 	prctl \
 	proc_pidinfo \
 	sched_yield \
@@ -2046,6 +2072,12 @@ case $host_os in
     LIBS=$ac_save_LIBS
     ;;
 esac
+
+ac_save_LIBS=$LIBS
+AC_SEARCH_LIBS(shm_open, rt,
+               [AC_DEFINE(HAVE_SHM_OPEN, 1, [Define to 1 if you have the `shm_open' function.])
+                test "$ac_res" = "none required" || AC_SUBST(RT_LIBS,"$ac_res")])
+LIBS=$ac_save_LIBS
 
 AC_CACHE_CHECK([for sched_setaffinity],wine_cv_have_sched_setaffinity,
                 AC_LINK_IFELSE([AC_LANG_PROGRAM(
@@ -3546,24 +3578,7 @@ else
 fonts \
 loader/wine.inf \
 nls \
-programs/msidb/msidb \
-programs/msiexec/msiexec \
-programs/notepad/notepad \
-programs/regedit/regedit \
-programs/regsvr32/regsvr32 \
-programs/wineboot/wineboot \
-programs/winecfg/winecfg \
-programs/wineconsole/wineconsole \
-programs/winedbg/winedbg \
-programs/winefile/winefile \
-programs/winemine/winemine \
-programs/winepath/winepath \
 server/wineserver"
-
-    case $host_os in
-      cygwin*|mingw32*|darwin*|macosx*|linux-android*) ;;
-      *) TOP_INSTALL_LIB="$TOP_INSTALL_LIB loader/wine.desktop" ;;
-    esac
 fi
 
 dnl Rules for cleaning
@@ -3574,6 +3589,16 @@ WINE_APPEND_RULE(
 maintainer-clean::
 	rm -f configure include/config.h.in])
 
+dnl Crossover hacks
+
+WINE_APPEND_RULE(
+[install-image: install-lib
+# Get rid of the files we don't want in the image
+	rm -rf \$(DESTDIR)\$(mandir)
+# Rename the wine loader (don't ask)
+	test x\$(filter wine,\$(WINELOADER_PROGRAMS)) = x || mv \$(DESTDIR)\$(bindir)/wine \$(DESTDIR)\$(bindir)/wineloader
+	test x\$(filter wine64,\$(WINELOADER_PROGRAMS)) = x || mv \$(DESTDIR)\$(bindir)/wine64 \$(DESTDIR)\$(bindir)/wineloader64])
+
 dnl Rules for generated source files
 
 WINE_APPEND_RULE(
@@ -3583,9 +3608,9 @@ programs/winetest/build.rc: dummy
 	@build=\"STRINGTABLE { 1 \\\"\`GIT_DIR=${wine_srcdir}.git git rev-parse HEAD 2>/dev/null\`\\\" }\" && (echo \$\$build | cmp -s - \$[@]) || echo \$\$build >\$[@] || (rm -f \$[@] && exit 1)
 programs/winetest/build.nfo:
 	@-\$(CC) -v 2>\$[@]
-dlls/wineandroid.drv/wine-debug.apk: dlls/wineandroid.drv/build.gradle ${wine_srcdir}dlls/wineandroid.drv/AndroidManifest.xml ${wine_srcdir}dlls/wineandroid.drv/WineActivity.java ${wine_srcdir}dlls/wineandroid.drv/wine.svg
-	cd dlls/wineandroid.drv && gradle -q -Psrcdir=$srcdir assembleDebug
-	mv dlls/wineandroid.drv/build/outputs/apk/wine-debug.apk \$[@]])
+dlls/wineandroid.drv/wineandroid.drv-debug.aar: dlls/wineandroid.drv/build.gradle ${wine_srcdir}/dlls/wineandroid.drv/AndroidManifest.xml ${wine_srcdir}/dlls/wineandroid.drv/WineDriver.java ${wine_srcdir}/dlls/wineandroid.drv/WineProvider.java ${wine_srcdir}/dlls/wineandroid.drv/wine.svg ${wine_srcdir}/dlls/wineandroid.drv/strings.xml
+	cd dlls/wineandroid.drv && \`cd ../.. && cd $srcdir && pwd\`/gradlew -q -Psrcdir=$srcdir assembleDebug
+	mv dlls/wineandroid.drv/build/outputs/aar/wineandroid.drv-debug.aar \$[@]])
 
 dnl Misc rules
 

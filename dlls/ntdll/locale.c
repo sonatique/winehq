@@ -91,6 +91,69 @@ invalid:
     return STATUS_INVALID_PARAMETER;
 }
 
+static PEB64 *get_peb64( void )
+{
+    TEB64 *teb64 = NtCurrentTeb64();
+
+    if (!teb64) return NULL;
+    return (PEB64 *)(UINT_PTR)teb64->Peb;
+}
+
+
+/* Unix format is: lang[_country][.charset][@modifier]
+ * Windows format is: lang[-script][-country][_modifier] */
+static LCID unix_locale_to_lcid( WCHAR *buffer )
+{
+    WCHAR win_name[LOCALE_NAME_MAX_LENGTH];
+    WCHAR *p, *country = NULL, *modifier = NULL;
+    LCID lcid;
+
+    if (!(p = wcspbrk( buffer, L"_.@" )))
+    {
+        if (!wcscmp( buffer, L"POSIX" ) || !wcscmp( buffer, L"C" ))
+            return MAKELCID( MAKELANGID(LANG_ENGLISH,SUBLANG_DEFAULT), SORT_DEFAULT );
+        wcscpy( win_name, buffer );
+    }
+    else
+    {
+        if (*p == '_')
+        {
+            *p++ = 0;
+            country = p;
+            p = wcspbrk( p, L".@" );
+        }
+        if (p && *p == '.')
+        {
+            *p++ = 0;
+            /* charset, ignore */
+            p = wcschr( p, '@' );
+        }
+        if (p)
+        {
+            *p++ = 0;
+            modifier = p;
+        }
+    }
+
+    /* rebuild a Windows name */
+
+    wcscpy( win_name, buffer );
+    if (modifier)
+    {
+        if (!wcscmp( modifier, L"latin" )) wcscat( win_name, L"-Latn" );
+        else if (!wcscmp( modifier, L"euro" )) {} /* ignore */
+        else return 0;
+    }
+    if (country)
+    {
+        p = win_name + wcslen(win_name);
+        *p++ = '-';
+        wcscpy( p, country );
+    }
+    RtlLocaleNameToLcid( win_name, &lcid, 2 );
+    return lcid;
+}
+
 
 void locale_init(void)
 {
@@ -103,6 +166,7 @@ void locale_init(void)
     void *ansi_ptr = utf8, *oem_ptr = utf8, *case_ptr;
     NTSTATUS status;
     const struct locale_nls_header *header;
+    PEB64 *peb64 = get_peb64();
 
     status = RtlGetLocaleFileMappingAddress( (void **)&header, &system_lcid, &unused );
     if (status)
@@ -112,6 +176,57 @@ void locale_init(void)
     }
     locale_table = (const NLS_LOCALE_HEADER *)((char *)header + header->locales);
     locale_strings = (const WCHAR *)((char *)locale_table + locale_table->strings_offset);
+
+
+    {
+        /* CrossOver hack for bug 15091: locale overrides in the registry. */
+        HANDLE user_key, wine_key;
+        NTSTATUS stat;
+        OBJECT_ATTRIBUTES attr;
+        UNICODE_STRING nameW;
+        LCID user_lcid = 0;
+
+        stat = RtlOpenCurrentUser( KEY_ALL_ACCESS, &user_key );
+        if (stat == STATUS_SUCCESS)
+        {
+            RtlInitUnicodeString( &nameW, L"Software\\Wine" );
+            InitializeObjectAttributes( &attr, &nameW, 0, user_key, NULL );
+            stat = NtCreateKey( &wine_key, KEY_ALL_ACCESS, &attr, 0, NULL, 0, NULL );
+            NtClose( user_key );
+        }
+        if (stat == STATUS_SUCCESS)
+        {
+            UNICODE_STRING categorystr;
+            WCHAR bufferW[46];
+            const KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION*)bufferW;
+            DWORD count;
+
+            RtlInitUnicodeString( &categorystr, L"LC_ALL" );
+            count = sizeof(bufferW);
+            if (!NtQueryValueKey( wine_key, &categorystr, KeyValuePartialInformation, bufferW, count, &count ))
+            {
+                system_lcid = user_lcid = unix_locale_to_lcid( (WCHAR *)info->Data );
+            }
+            else
+            {
+                RtlInitUnicodeString( &categorystr, L"LC_CTYPE" );
+                count = sizeof(bufferW);
+                if (!NtQueryValueKey( wine_key, &categorystr, KeyValuePartialInformation, bufferW, count, &count ))
+                    system_lcid = unix_locale_to_lcid( bufferW );
+                RtlInitUnicodeString( &categorystr, L"LC_MESSAGES" );
+                count = sizeof(bufferW);
+                if (!NtQueryValueKey( wine_key, &categorystr, KeyValuePartialInformation, bufferW, count, &count ))
+                    system_lcid = unix_locale_to_lcid( bufferW );
+            }
+            NtClose( wine_key );
+        }
+        if (user_lcid)
+        {
+            NtSetDefaultUILanguage( user_lcid );
+            NtSetDefaultLocale( TRUE, user_lcid );
+        }
+        NtSetDefaultLocale( FALSE, system_lcid );
+    }
 
     entry = find_lcid_entry( locale_table, system_lcid );
     ansi_cp = get_locale_data( locale_table, entry->idx )->idefaultansicodepage;
@@ -160,15 +275,18 @@ void locale_init(void)
 
     NtGetNlsSectionPtr( 10, 0, NULL, &case_ptr, &size );
     NtCurrentTeb()->Peb->UnicodeCaseTableData = case_ptr;
+    if (peb64) peb64->UnicodeCaseTableData = PtrToUlong( case_ptr );
     if (ansi_cp != CP_UTF8)
     {
         NtGetNlsSectionPtr( 11, ansi_cp, NULL, &ansi_ptr, &size );
         NtCurrentTeb()->Peb->AnsiCodePageData = ansi_ptr;
+        if (peb64) peb64->AnsiCodePageData = PtrToUlong( ansi_ptr );
     }
     if (oem_cp != CP_UTF8)
     {
         NtGetNlsSectionPtr( 11, oem_cp, NULL, &oem_ptr, &size );
         NtCurrentTeb()->Peb->OemCodePageData = oem_ptr;
+        if (peb64) peb64->OemCodePageData = PtrToUlong( oem_ptr );
     }
     RtlInitNlsTables( ansi_ptr, oem_ptr, case_ptr, &nls_info );
     NlsAnsiCodePage     = nls_info.AnsiTableInfo.CodePage;

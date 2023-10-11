@@ -1,0 +1,63 @@
+workflow:
+  name: $PIPELINE_NAME
+  rules:
+    - if: $CI_COMMIT_TITLE
+      variables:
+        # Prefix the default pipeline title with the branch name
+        PIPELINE_NAME: "[$CI_COMMIT_BRANCH] $CI_COMMIT_TITLE"
+    - when: always
+
+propagate:
+  stage: build
+  image: $CI_REGISTRY/$CI_PROJECT_NAMESPACE/crossover:debian-bullseye
+  rules:
+    # To automatically create a commit to update the corresponding submodule
+    # in the parent repository set the following variables:
+    # - PARENT_PROJECT_ID    The project id of the parent repository
+    # - PARENT_TRIGGER_TOKEN The trigger token for the parent repository
+    #                        (should be a masked variable)
+    - if: $CI_PIPELINE_SOURCE == 'push' && $PARENT_PROJECT_ID && $PARENT_TRIGGER_TOKEN
+  script:
+    - echo "Propagate $CI_COMMIT_SHA to the parent project ($PARENT_PROJECT_ID)"
+    # HACK: GitLab creates ownership issues that cause Git failures
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - |
+      # Build the commit message
+      set -e
+      PROPAGATE_TITLE="$CI_PROJECT_NAME update: $CI_COMMIT_TITLE"
+      commitmsg=$(mktemp)
+      if [ $(git rev-list "^$CI_COMMIT_BEFORE_SHA" "$CI_COMMIT_SHA" | wc -l) -gt 1 ]
+      then
+          echo "$PROPAGATE_TITLE"
+          echo
+          echo "Also includes commits:"
+          git log --pretty=format:"* %s" ^$CI_COMMIT_BEFORE_SHA $CI_COMMIT_SHA^
+          echo
+          GIT_AUTHOR_NAME=$GITLAB_USER_NAME
+          GIT_AUTHOR_EMAIL=$GITLAB_USER_EMAIL
+          GIT_AUTHOR_DATE=
+      else  # single commit
+          echo -n "$CI_PROJECT_NAME update: "
+          git cat-file commit $CI_COMMIT_SHA | sed '1,/^$/ d'
+          # Set GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL and GIT_AUTHOR_DATE
+          . /usr/lib/git-core/git-sh-setup
+          eval "$(get_author_ident_from_commit $CI_COMMIT_SHA)"
+      fi >"$commitmsg"
+
+      # Forward the information to the parent project
+      curl --fail --no-progress-meter --request POST \
+          --form-string token=$PARENT_TRIGGER_TOKEN \
+          --form-string ref=$CI_COMMIT_BRANCH \
+          --form-string "variables[GIT_AUTHOR_NAME]=$GIT_AUTHOR_NAME" \
+          --form-string "variables[GIT_AUTHOR_EMAIL]=$GIT_AUTHOR_EMAIL" \
+          --form-string "variables[GIT_AUTHOR_DATE]=$GIT_AUTHOR_DATE" \
+          --form-string "variables[PROPAGATE_COMMIT_ID]=$CI_COMMIT_SHA" \
+          --form        "variables[PROPAGATE_COMMIT_MSG]=<$commitmsg" \
+          --form-string "variables[PROPAGATE_PROJECT]=$CI_PROJECT_NAME" \
+          --form-string "variables[PROPAGATE_TITLE]=$PROPAGATE_TITLE" \
+          "$CI_API_V4_URL/projects/$PARENT_PROJECT_ID/trigger/pipeline" ||
+        ( rc=$?
+          echo "Maybe $CI_COMMIT_BRANCH does not exist in the parent project?"
+          exit $rc
+        )
+      # Let GitLab handle the cleanup

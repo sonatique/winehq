@@ -49,18 +49,15 @@
 #include "main.h"
 
 #if defined(__x86_64__)
-/* Rosetta on Apple Silicon allocates memory starting at 0x100000000 (the 4GB line)
- * before the preloader runs, which prevents any nonrelocatable EXEs with that
- * base address from running.
- *
- * This empty linker section forces Rosetta's allocations (currently ~132 MB)
- * to start at 0x114000000, and they should end below 0x120000000.
+/* Reserve the low 8GB using a zero-fill section, this is the only way to
+ * prevent system frameworks from using any of it (including allocations
+ * before any preloader code runs)
  */
-__asm__(".zerofill WINE_4GB_RESERVE,WINE_4GB_RESERVE,___wine_4gb_reserve,0x14000000");
+__asm__(".zerofill WINE_RESERVE,WINE_RESERVE,___wine_reserve,0x1fffff000");
 
 static const struct wine_preload_info zerofill_sections[] =
 {
-    { (void *)0x000100000000, 0x14000000 },  /* WINE_4GB_RESERVE section */
+    { (void *)0x000000001000, 0x1fffff000 }, /* WINE_RESERVE section */
     { 0, 0 }                                 /* end of list */
 };
 #else
@@ -90,12 +87,9 @@ static struct wine_preload_info preload_info[] =
     { (void *)0x00001000, 0x0000f000 },  /* low 64k */
     { (void *)0x00010000, 0x00100000 },  /* DOS area */
     { (void *)0x00110000, 0x67ef0000 },  /* low memory area */
-    { (void *)0x7f000000, 0x03000000 },  /* top-down allocations + shared heap + virtual heap */
+    { (void *)0x7f000000, 0x03000000 },  /* top-down allocations + shared user data + virtual heap */
 #else  /* __i386__ */
-    { (void *)0x000000010000, 0x00100000 },  /* DOS area */
-    { (void *)0x000000110000, 0x67ef0000 },  /* low memory area */
-    { (void *)0x00007ff00000, 0x000f0000 },  /* shared user data */
-    { (void *)0x000100000000, 0x14000000 },  /* WINE_4GB_RESERVE section */
+    { (void *)0x000000001000, 0x1fffff000 }, /* WINE_RESERVE section */
     { (void *)0x7ff000000000, 0x01ff0000 },  /* top-down allocations + virtual heap */
 #endif /* __i386__ */
     { 0, 0 },                            /* PE exe range set with WINEPRELOADRESERVE */
@@ -111,6 +105,39 @@ static struct wine_preload_info preload_info[] =
 void *__stack_chk_guard = 0;
 void __stack_chk_fail_local(void) { return; }
 void __stack_chk_fail(void) { return; }
+
+/* Binaries targeting 10.6 and 10.7 contain the __program_vars section, and
+ * dyld4 (starting in Monterey) does not like it to be missing:
+ * - running vmmap on a Wine process prints this warning:
+ *   "Process exists but has not fully started -- dyld has initialized but libSystem has not"
+ * - because libSystem is not initialized, dlerror() always returns NULL (causing GStreamer
+ *   to crash on init).
+ * - starting with macOS Sonoma, Wine crashes on launch if libSystem is not initialized.
+ *
+ * Adding __program_vars fixes those issues, and also allows more of the vars to
+ * be set correctly by the preloader for the loaded binary.
+ *
+ * See also:
+ * <https://github.com/apple-oss-distributions/Csu/blob/Csu-88/crt.c#L42>
+ * <https://github.com/apple-oss-distributions/dyld/blob/dyld-1042.1/common/MachOAnalyzer.cpp#L2185>
+ */
+int           NXArgc = 0;
+const char**  NXArgv = NULL;
+const char**  environ = NULL;
+const char*   __progname = NULL;
+
+extern void* __dso_handle;
+struct ProgramVars
+{
+    void*           mh;
+    int*            NXArgcPtr;
+    const char***   NXArgvPtr;
+    const char***   environPtr;
+    const char**    __prognamePtr;
+};
+__attribute__((used))  static struct ProgramVars pvars
+__attribute__ ((section ("__DATA,__program_vars")))  = { &__dso_handle, &NXArgc, &NXArgv, &environ, &__progname };
+
 
 /*
  * When 'start' is called, stack frame looks like:
@@ -323,6 +350,41 @@ extern int _dyld_func_lookup( const char *dyld_func_name, void **address );
 
 /* replacement for libc functions */
 
+#ifdef __i386__ /* CrossOver Hack #16371 */
+static inline size_t wld_strlen( const char *str )
+{
+    size_t len;
+    for (len = 0; str[len]; ++len)
+        /* nothing */;
+    return len;
+}
+
+static inline int wld_tolower( int c )
+{
+    if ('A' <= c && c <= 'Z')
+        return c - 'A' + 'a';
+    return c;
+}
+
+static inline int wld_strncasecmp( const char *str1, const char *str2, size_t len )
+{
+    if (len <= 0) return 0;
+    while ((--len > 0) && *str1 && (wld_tolower(*str1) == wld_tolower(*str2))) { str1++; str2++; }
+    return wld_tolower(*str1) - wld_tolower(*str2);
+}
+
+static inline const char * wld_strcasestr( const char *haystack, const char *needle )
+{
+    size_t len = wld_strlen(needle);
+    for ( ; *haystack ; ++haystack)
+    {
+        if (!wld_strncasecmp(haystack, needle, len))
+            return haystack;
+    }
+    return NULL;
+}
+#endif
+
 void * memmove( void *dst, const void *src, size_t len )
 {
     char *d = dst;
@@ -439,7 +501,7 @@ static int preloader_overlaps_range( const void *start, const void *end )
             struct target_segment_command *seg = (struct target_segment_command*)cmd;
             const void *seg_start = (const void*)(seg->vmaddr + slide);
             const void *seg_end = (const char*)seg_start + seg->vmsize;
-            static const char reserved_segname[] = "WINE_4GB_RESERVE";
+            static const char reserved_segname[] = "WINE_RESERVE";
 
             if (!wld_strncmp( seg->segname, reserved_segname, sizeof(reserved_segname)-1 ))
                 continue;
@@ -626,15 +688,16 @@ static void fixup_stack( void *stack )
 static void set_program_vars( void *stack, void *mod )
 {
     int *pargc;
-    char **argv, **env;
+    const char **argv, **env;
     int *wine_NXArgc = pdlsym( mod, "NXArgc" );
-    char ***wine_NXArgv = pdlsym( mod, "NXArgv" );
-    char ***wine_environ = pdlsym( mod, "environ" );
+    const char ***wine_NXArgv = pdlsym( mod, "NXArgv" );
+    const char ***wine_environ = pdlsym( mod, "environ" );
 
     pargc = stack;
-    argv = (char **)pargc + 1;
+    argv = (const char **)pargc + 1;
     env = &argv[*pargc-1] + 2;
 
+    /* set vars in the loaded binary */
     if (wine_NXArgc)
         *wine_NXArgc = *pargc;
     else
@@ -649,11 +712,18 @@ static void set_program_vars( void *stack, void *mod )
         *wine_environ = env;
     else
         wld_printf( "preloader: Warning: failed to set environ\n" );
+
+    /* set vars in the __program_vars section */
+    NXArgc = *pargc;
+    NXArgv = argv;
+    environ = env;
 }
 
 void *wld_start( void *stack, int *is_unix_thread )
 {
+#ifdef __i386__
     struct wine_preload_info builtin_dlls = { (void *)0x7a000000, 0x02000000 };
+#endif
     struct wine_preload_info **wine_main_preload_info;
     char **argv, **p, *reserve = NULL;
     struct target_mach_header *mh;
@@ -681,6 +751,19 @@ void *wld_start( void *stack, int *is_unix_thread )
     LOAD_POSIX_DYLD_FUNC( dladdr );
     LOAD_MACHO_DYLD_FUNC( _dyld_get_image_slide );
 
+#ifdef __i386__ /* CrossOver Hack #16371 */
+    {
+        const char *qw;
+        if (*pargc >= 3 && (qw = wld_strcasestr(argv[2], "qw")) && wld_strcasestr(qw + 2, "patch.exe"))
+        {
+            if (preload_info[3].addr == (void *)0x00110000 && preload_info[3].size == 0x67ef0000)
+                preload_info[3].size = 0x70ef0000;
+            else
+                wld_printf( "warning: detected Quicken patcher (%s) but preload_info is not as expected; not applying adjustment", argv[2] );
+        }
+    }
+#endif
+
     /* reserve memory that Wine needs */
     if (reserve) preload_reserve( reserve );
     for (i = 0; preload_info[i].size; i++)
@@ -692,15 +775,19 @@ void *wld_start( void *stack, int *is_unix_thread )
         }
     }
 
+#ifdef __i386__
     if (!map_region( &builtin_dlls ))
         builtin_dlls.size = 0;
+#endif
 
     /* load the main binary */
     if (!(mod = pdlopen( argv[1], RTLD_NOW )))
         fatal_error( "%s: could not load binary\n", argv[1] );
 
+#ifdef __i386__
     if (builtin_dlls.size)
         wld_munmap( builtin_dlls.addr, builtin_dlls.size );
+#endif
 
     /* store pointer to the preload info into the appropriate main binary variable */
     wine_main_preload_info = pdlsym( mod, "wine_main_preload_info" );

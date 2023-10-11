@@ -1,8 +1,18 @@
 MODULE    = winemac.drv
 UNIXLIB   = winemac.so
 IMPORTS   = uuid rpcrt4 user32 gdi32 win32u
-DELAYIMPORTS = ole32 shell32 imm32
-UNIX_LIBS    = -lwin32u -framework AppKit -framework Carbon -framework Security -framework OpenGL -framework IOKit -framework CoreVideo -framework QuartzCore $(METAL_LIBS)
+DELAYIMPORTS = advapi32 ole32 shell32 imm32
+UNIX_LIBS    = \
+	-lwin32u \
+	-framework AppKit \
+	-framework Carbon \
+	-framework CoreVideo \
+	-framework Foundation \
+	-framework IOKit \
+	-framework OpenGL \
+	-framework QuartzCore \
+	-framework Security \
+	$(METAL_LIBS)
 
 C_SRCS = \
 	clipboard.c \
@@ -11,6 +21,7 @@ C_SRCS = \
 	dragdrop.c \
 	event.c \
 	gdi.c \
+	gpt.c \
 	image.c \
 	ime.c \
 	keyboard.c \

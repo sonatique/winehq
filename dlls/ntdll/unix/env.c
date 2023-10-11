@@ -65,6 +65,7 @@ WOW_PEB *wow_peb = NULL;
 USHORT *uctable = NULL, *lctable = NULL;
 SIZE_T startup_info_size = 0;
 BOOL is_prefix_bootstrap = FALSE;
+BOOL wow64_using_32bit_prefix = FALSE;
 
 static const WCHAR bootstrapW[] = {'W','I','N','E','B','O','O','T','S','T','R','A','P','M','O','D','E'};
 
@@ -1097,6 +1098,9 @@ static void add_dynamic_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
     append_envA( env, pos, size, "WINEUSERLOCALE", user_locale );
     append_envA( env, pos, size, "SystemDrive", "C:" );
     append_envA( env, pos, size, "SystemRoot", "C:\\windows" );
+
+    /* CW HACK 20810: Set this environment variable so PE code can look for it. */
+    if (wow64_using_32bit_prefix) append_envA( env, pos, size, "WINEWOW6432BPREFIXMODE", "1" );
 }
 
 
@@ -1702,7 +1706,7 @@ static inline void dup_unicode_string( const UNICODE_STRING *src, WCHAR **dst, U
     str->Length = src->Length;
     str->MaximumLength = src->MaximumLength;
     memcpy( *dst, src->Buffer, src->MaximumLength );
-    *dst += src->MaximumLength / sizeof(WCHAR);
+    *dst += (src->MaximumLength + 1) / sizeof(WCHAR);
 }
 
 
@@ -1798,7 +1802,7 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
                    + params->WindowTitle.MaximumLength
                    + params->Desktop.MaximumLength
                    + params->ShellInfo.MaximumLength
-                   + params->RuntimeInfo.MaximumLength
+                   + ((params->RuntimeInfo.MaximumLength + 1) & ~1)
                    + params->EnvironmentSize);
 
     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&wow64_params, 0, &size,
